@@ -2,14 +2,13 @@
 #define BPTREE_H
 
 #include <cstring>
-#include <fstream>
 #include <vector>
 #include <cstdio>
 #include <algorithm>
 
 const int MAX_KEY_LEN = 64;
 const int BLOCK_SIZE = 4096;
-const int MAX_KEYS = 50;  // Tuned for performance
+const int MAX_CHILDREN = 60;  // Tuned for performance
 
 struct Key {
     char data[MAX_KEY_LEN + 1];
@@ -21,11 +20,13 @@ struct Key {
         if (s) strncpy(data, s, MAX_KEY_LEN);
     }
 
-    bool operator<(const Key& o) const { return strcmp(data, o.data) < 0; }
-    bool operator<=(const Key& o) const { return strcmp(data, o.data) <= 0; }
-    bool operator>(const Key& o) const { return strcmp(data, o.data) > 0; }
-    bool operator>=(const Key& o) const { return strcmp(data, o.data) >= 0; }
-    bool operator==(const Key& o) const { return strcmp(data, o.data) == 0; }
+    int compare(const Key& o) const { return strcmp(data, o.data); }
+
+    bool operator<(const Key& o) const { return compare(o) < 0; }
+    bool operator<=(const Key& o) const { return compare(o) <= 0; }
+    bool operator>(const Key& o) const { return compare(o) > 0; }
+    bool operator>=(const Key& o) const { return compare(o) >= 0; }
+    bool operator==(const Key& o) const { return compare(o) == 0; }
 };
 
 struct KeyValue {
@@ -36,30 +37,25 @@ struct KeyValue {
     KeyValue(const Key& k, int v) : key(k), value(v) {}
 
     bool operator<(const KeyValue& o) const {
-        int cmp = strcmp(key.data, o.key.data);
+        int cmp = key.compare(o.key);
         return cmp < 0 || (cmp == 0 && value < o.value);
     }
 
     bool operator==(const KeyValue& o) const {
         return key == o.key && value == o.value;
     }
-
-    bool operator>(const KeyValue& o) const {
-        int cmp = strcmp(key.data, o.key.data);
-        return cmp > 0 || (cmp == 0 && value > o.value);
-    }
 };
 
 struct Node {
     bool is_leaf;
     int count;
-    int parent;
-    int children[MAX_KEYS + 1];
-    KeyValue data[MAX_KEYS];
+    int children[MAX_CHILDREN];  // For internal nodes
+    KeyValue data[MAX_CHILDREN - 1];  // Actual data
+    Key keys[MAX_CHILDREN - 1];  // Routing keys for internal nodes
     int next;  // For leaf nodes
 
-    Node() : is_leaf(true), count(0), parent(-1), next(-1) {
-        for (int i = 0; i <= MAX_KEYS; i++) children[i] = -1;
+    Node() : is_leaf(true), count(0), next(-1) {
+        for (int i = 0; i < MAX_CHILDREN; i++) children[i] = -1;
     }
 };
 
@@ -79,8 +75,9 @@ private:
 
     void readHeader() {
         fseek(file, 0, SEEK_SET);
-        fread(&root_offset, sizeof(int), 1, file);
-        fread(&node_count, sizeof(int), 1, file);
+        size_t r1 = fread(&root_offset, sizeof(int), 1, file);
+        size_t r2 = fread(&node_count, sizeof(int), 1, file);
+        (void)r1; (void)r2;
     }
 
     int allocNode() {
@@ -95,13 +92,8 @@ private:
 
     void readNode(int offset, Node& node) {
         fseek(file, sizeof(int) * 2 + offset * sizeof(Node), SEEK_SET);
-        fread(&node, sizeof(Node), 1, file);
-    }
-
-    int findChild(Node& node, const KeyValue& kv) {
-        int i = 0;
-        while (i < node.count && kv.key >= node.data[i].key) i++;
-        return i;
+        size_t r = fread(&node, sizeof(Node), 1, file);
+        (void)r;
     }
 
     int findLeaf(const Key& key) {
@@ -115,87 +107,138 @@ private:
             if (node.is_leaf) return current;
 
             int i = 0;
-            while (i < node.count && key >= node.data[i].key) i++;
+            while (i < node.count - 1 && key >= node.keys[i]) i++;
             current = node.children[i];
         }
     }
 
-    void insertNonFull(int offset, const KeyValue& kv) {
+    void insertIntoLeaf(int offset, const KeyValue& kv) {
+        Node node;
+        readNode(offset, node);
+
+        // Check for duplicate
+        for (int i = 0; i < node.count; i++) {
+            if (node.data[i] == kv) return;
+        }
+
+        // Find position and insert
+        int i = node.count - 1;
+        while (i >= 0 && node.data[i].key > kv.key ||
+               (node.data[i].key == kv.key && node.data[i].value > kv.value)) {
+            node.data[i + 1] = node.data[i];
+            i--;
+        }
+        node.data[i + 1] = kv;
+        node.count++;
+        writeNode(offset, node);
+    }
+
+    void splitLeaf(int offset, KeyValue& promoteKey, int& newLeafOffset) {
+        Node oldLeaf;
+        readNode(offset, oldLeaf);
+
+        int mid = oldLeaf.count / 2;
+
+        Node newLeaf;
+        newLeaf.is_leaf = true;
+        newLeaf.count = oldLeaf.count - mid;
+        for (int i = 0; i < newLeaf.count; i++) {
+            newLeaf.data[i] = oldLeaf.data[mid + i];
+        }
+
+        newLeaf.next = oldLeaf.next;
+        oldLeaf.count = mid;
+
+        newLeafOffset = allocNode();
+        oldLeaf.next = newLeafOffset;
+
+        promoteKey = newLeaf.data[0];
+
+        writeNode(offset, oldLeaf);
+        writeNode(newLeafOffset, newLeaf);
+    }
+
+    void splitInternal(int offset, KeyValue& promoteKey, int& newNodeOffset) {
+        Node oldNode;
+        readNode(offset, oldNode);
+
+        int mid = oldNode.count / 2;
+
+        Node newNode;
+        newNode.is_leaf = false;
+        newNode.count = oldNode.count - mid;
+
+        for (int i = 0; i < newNode.count - 1; i++) {
+            newNode.keys[i] = oldNode.keys[mid + i];
+        }
+        for (int i = 0; i < newNode.count; i++) {
+            newNode.children[i] = oldNode.children[mid + i];
+        }
+
+        promoteKey.key = oldNode.keys[mid - 1];
+        oldNode.count = mid;
+
+        newNodeOffset = allocNode();
+
+        writeNode(offset, oldNode);
+        writeNode(newNodeOffset, newNode);
+    }
+
+    bool insertRecursive(int offset, const KeyValue& kv, KeyValue& promoteKey, int& newChildOffset) {
         Node node;
         readNode(offset, node);
 
         if (node.is_leaf) {
-            // Check for duplicate
-            for (int i = 0; i < node.count; i++) {
-                if (node.data[i] == kv) return;
+            if (node.count < MAX_CHILDREN - 1) {
+                insertIntoLeaf(offset, kv);
+                return false;
+            } else {
+                insertIntoLeaf(offset, kv);
+                splitLeaf(offset, promoteKey, newChildOffset);
+                return true;
             }
-
-            int i = node.count - 1;
-            while (i >= 0 && node.data[i] > kv) {
-                node.data[i + 1] = node.data[i];
-                i--;
-            }
-            node.data[i + 1] = kv;
-            node.count++;
-            writeNode(offset, node);
         } else {
-            int i = findChild(node, kv);
-            Node child;
-            readNode(node.children[i], child);
+            // Find which child to descend to
+            int i = 0;
+            while (i < node.count - 1 && kv.key >= node.keys[i]) i++;
 
-            if (child.count == MAX_KEYS) {
-                splitChild(offset, i);
-                readNode(offset, node);
-                if (kv.key >= node.data[i].key) i++;
+            KeyValue childPromote;
+            int childNewOffset;
+            bool needSplit = insertRecursive(node.children[i], kv, childPromote, childNewOffset);
+
+            if (!needSplit) return false;
+
+            // Insert promoted key into current internal node
+            if (node.count < MAX_CHILDREN) {
+                // Insert without splitting
+                for (int j = node.count - 1; j > i; j--) {
+                    node.keys[j] = node.keys[j - 1];
+                }
+                for (int j = node.count; j > i + 1; j--) {
+                    node.children[j] = node.children[j - 1];
+                }
+                node.keys[i] = childPromote.key;
+                node.children[i + 1] = childNewOffset;
+                node.count++;
+                writeNode(offset, node);
+                return false;
+            } else {
+                // Need to split internal node
+                for (int j = node.count - 1; j > i; j--) {
+                    node.keys[j] = node.keys[j - 1];
+                }
+                for (int j = node.count; j > i + 1; j--) {
+                    node.children[j] = node.children[j - 1];
+                }
+                node.keys[i] = childPromote.key;
+                node.children[i + 1] = childNewOffset;
+                node.count++;
+
+                writeNode(offset, node);
+                splitInternal(offset, promoteKey, newChildOffset);
+                return true;
             }
-            insertNonFull(node.children[i], kv);
         }
-    }
-
-    void splitChild(int parent_off, int index) {
-        Node parent;
-        readNode(parent_off, parent);
-
-        Node full_node;
-        readNode(parent.children[index], full_node);
-
-        int mid = full_node.count / 2;
-        Node new_node;
-        new_node.is_leaf = full_node.is_leaf;
-        new_node.parent = parent_off;
-
-        if (full_node.is_leaf) {
-            new_node.count = full_node.count - mid;
-            for (int i = 0; i < new_node.count; i++) {
-                new_node.data[i] = full_node.data[mid + i];
-            }
-            full_node.count = mid;
-            new_node.next = full_node.next;
-            full_node.next = node_count;
-        } else {
-            new_node.count = full_node.count - mid - 1;
-            for (int i = 0; i < new_node.count; i++) {
-                new_node.data[i] = full_node.data[mid + 1 + i];
-                new_node.children[i] = full_node.children[mid + 1 + i];
-            }
-            new_node.children[new_node.count] = full_node.children[full_node.count];
-            full_node.count = mid;
-        }
-
-        int new_offset = allocNode();
-
-        for (int i = parent.count; i > index; i--) {
-            parent.data[i] = parent.data[i - 1];
-            parent.children[i + 1] = parent.children[i];
-        }
-
-        parent.data[index] = full_node.is_leaf ? new_node.data[0] : full_node.data[mid];
-        parent.children[index + 1] = new_offset;
-        parent.count++;
-
-        writeNode(parent_off, parent);
-        writeNode(parent.children[index], full_node);
-        writeNode(new_offset, new_node);
     }
 
 public:
@@ -231,23 +274,24 @@ public:
             return;
         }
 
-        Node root;
-        readNode(root_offset, root);
+        KeyValue promoteKey;
+        int newChildOffset;
+        bool needSplit = insertRecursive(root_offset, kv, promoteKey, newChildOffset);
 
-        if (root.count == MAX_KEYS) {
-            int new_root_off = allocNode();
-            Node new_root;
-            new_root.is_leaf = false;
-            new_root.count = 0;
-            new_root.children[0] = root_offset;
-            writeNode(new_root_off, new_root);
+        if (needSplit) {
+            int oldRoot = root_offset;
+            root_offset = allocNode();
 
-            root_offset = new_root_off;
-            splitChild(root_offset, 0);
+            Node newRoot;
+            newRoot.is_leaf = false;
+            newRoot.count = 2;
+            newRoot.keys[0] = promoteKey.key;
+            newRoot.children[0] = oldRoot;
+            newRoot.children[1] = newChildOffset;
+
+            writeNode(root_offset, newRoot);
             writeHeader();
         }
-
-        insertNonFull(root_offset, kv);
     }
 
     void find(const char* key_str, std::vector<int>& result) {
@@ -258,21 +302,21 @@ public:
         int leaf_off = findLeaf(key);
         if (leaf_off == -1) return;
 
+        // Scan through linked leaf nodes
         while (leaf_off != -1) {
             Node node;
             readNode(leaf_off, node);
 
-            bool found_any = false;
             for (int i = 0; i < node.count; i++) {
                 if (node.data[i].key == key) {
                     result.push_back(node.data[i].value);
-                    found_any = true;
-                } else if (found_any || node.data[i].key > key) {
-                    break;
+                } else if (node.data[i].key > key) {
+                    // Keys are sorted, so we're past our target
+                    std::sort(result.begin(), result.end());
+                    return;
                 }
             }
 
-            if (!found_any) break;
             leaf_off = node.next;
         }
 
